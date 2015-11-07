@@ -55,6 +55,17 @@ public class ConnectionInfo {
         this.url = url;
     }
 
+    public ConnectionInfo(String driverClassName, String password, String tenantId, String url, String username) {
+        this.driverClassName = driverClassName;
+        this.password = password;
+        this.tenantId = tenantId;
+        this.url = url;
+        this.username = username;
+    }
+
+    public ConnectionInfo() {
+    }
+
     @Override
     public String toString() {
         return "ConnectionInfo{" +

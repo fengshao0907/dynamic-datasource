@@ -1,5 +1,6 @@
 package org.nojava.dynamic.core;
 
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import org.nojava.dynamic.config.ConnectionInfo;
 import org.nojava.dynamic.config.DynamicConfig;
@@ -10,6 +11,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.*;
@@ -36,9 +38,15 @@ public class DynamicPool {
     private Map<String, ConnectionInfo> connectionInfoConfig = Maps.newHashMap();
 
 
+    private ConcurrentHashMap<String, ReentrantLock> tenantLock = new ConcurrentHashMap<>();
+
     private ConcurrentHashMap<String, AtomicInteger> createdConnections = new ConcurrentHashMap<>();
 
     private ConcurrentHashMap<String, AtomicInteger> queueConnections = new ConcurrentHashMap<>();
+
+
+    //初始化标记
+    private List<String> initTenantId = Lists.newLinkedList();
 
 
     public ConcurrentHashMap<String, BlockingQueue<ConnectionHandle>> getConnectionHandleQueue() {
@@ -49,12 +57,10 @@ public class DynamicPool {
         return createdConnections;
     }
 
+
     public ConcurrentHashMap<String, AtomicInteger> getQueueConnections() {
         return queueConnections;
     }
-
-
-    private ReentrantLock createCloseLock = new ReentrantLock();
 
 
     public Connection getConnection(String tenantId) throws Exception {
@@ -82,42 +88,25 @@ public class DynamicPool {
     }
 
     public synchronized void initCount(String tenantId) {
-
-        if (queueConnections.get(tenantId) == null) {
+        if (!initTenantId.contains(tenantId)) {
+            initTenantId.add(tenantId);
             queueConnections.put(tenantId, new AtomicInteger(0));
-        }
-
-        if (createdConnections.get(tenantId) == null) {
             createdConnections.put(tenantId, new AtomicInteger(0));
-        }
-
-        if (connectionHandleQueue.get(tenantId) == null) {
-            connectionHandleQueue.put(tenantId, new LinkedBlockingQueue<ConnectionHandle>());
+            connectionHandleQueue.put(tenantId, new LinkedBlockingQueue<>());
+            tenantLock.put(tenantId, new ReentrantLock());
         }
     }
 
     private Connection createConnectionOrPoll(String tenantId) throws Exception {
-        ConnectionHandle connectionHandle = null;
-        createCloseLock.lock();
+
         try {
-            //创建或获取立马返回
+            tenantLock.get(tenantId).lock();
+            //未达到最大数量，并且无闲置数量，创建
             if (createdConnections.get(tenantId).get() < dynamicConfig.getMaxConnction() && queueConnections.get(tenantId).get() == 0) {
-                connectionHandle = buildConnection(connectionInfoConfig.get(tenantId));
-                createdConnections.get(tenantId).getAndAdd(1);
-                connectionHandle.setBorrowTime(System.currentTimeMillis());
-                connectionHandle.setReturnTime(-1l);
-                return connectionHandle;
+                return getNewConnection(tenantId);
             }
-            //从队列中取，不创建
-            if (queueConnections.get(tenantId).get() > 0) {
-                connectionHandle = connectionHandleQueue.get(tenantId).poll();
-                queueConnections.get(tenantId).getAndAdd(-1);
-                connectionHandle.setBorrowTime(System.currentTimeMillis());
-                connectionHandle.setReturnTime(-1l);
-                return connectionHandle;
-            }
-            //达到db最大连接数
-            connectionHandle = connectionHandleQueue.get(tenantId).poll(dynamicConfig.getWaitTime(), TimeUnit.SECONDS);
+            //从队列中取，不创建,达到db最大连接数
+            ConnectionHandle connectionHandle = connectionHandleQueue.get(tenantId).poll(dynamicConfig.getWaitTime(), TimeUnit.SECONDS);
             queueConnections.get(tenantId).getAndAdd(-1);
             connectionHandle.setBorrowTime(System.currentTimeMillis());
             connectionHandle.setReturnTime(-1l);
@@ -126,9 +115,17 @@ public class DynamicPool {
             logger.error("租户：" + tenantId, e);
             throw e;
         } finally {
-            createCloseLock.unlock();
+            tenantLock.get(tenantId).unlock();
         }
 
+    }
+
+    private Connection getNewConnection(String tenantId) throws Exception {
+        ConnectionHandle connectionHandle = buildConnection(connectionInfoConfig.get(tenantId));
+        createdConnections.get(tenantId).getAndAdd(1);
+        connectionHandle.setBorrowTime(System.currentTimeMillis());
+        connectionHandle.setReturnTime(-1l);
+        return connectionHandle;
     }
 
 
@@ -146,7 +143,7 @@ public class DynamicPool {
         Thread thread = new Thread(future);
         thread.start();
         try {
-            connection = future.get(3, TimeUnit.SECONDS);
+            connection = future.get(5, TimeUnit.SECONDS);
         } catch (Exception e) {
             logger.error("链接信息为:" + connectionInfo.toString());
             throw e;
@@ -165,29 +162,28 @@ public class DynamicPool {
 
 
     public void close(Connection connection) throws InterruptedException {
-        ConnectionHandle connectionHandle = (ConnectionHandle) connection;
-        logger.info("close-" + connectionHandle.getTenantId());
-        connectionHandle.setReturnTime(System.currentTimeMillis());
-        connectionHandle.setBorrowTime(-1l);
         try {
-            createCloseLock.lock();
+            ConnectionHandle connectionHandle = (ConnectionHandle) connection;
+            logger.info("close-" + connectionHandle.getTenantId());
+            connectionHandle.setReturnTime(System.currentTimeMillis());
+            connectionHandle.setBorrowTime(-1l);
+
             connectionHandleQueue.get(connectionHandle.getTenantId())
                     .put(connectionHandle);
             queueConnections.get(connectionHandle.getTenantId()).getAndAdd(1);
         } catch (Exception e) {
             logger.error("close error", e);
             throw e;
-        } finally {
-            createCloseLock.unlock();
         }
 
     }
 
     public void cleanIdleConn() {
         logger.debug("cleanIdleConn-");
-        createCloseLock.lock();
-        try {
-            for (String tenantId : getConnectionHandleQueue().keySet()) {
+
+        for (String tenantId : getConnectionHandleQueue().keySet()) {
+            try {
+                tenantLock.get(tenantId).lock();
                 Set<ConnectionHandle> waitClean = new HashSet<>();
                 for (ConnectionHandle connectionHandle : getConnectionHandleQueue().get(tenantId)) {
                     if (allowClose(connectionHandle.getReturnTime())) {
@@ -207,13 +203,14 @@ public class DynamicPool {
                     }
 
                 }
+            } catch (Exception e) {
+                logger.error("cleanIdleConn", e);
+                throw e;
+            } finally {
+                tenantLock.get(tenantId).unlock();
             }
-        } catch (Exception e) {
-            logger.error("cleanIdleConn", e);
-            throw e;
-        } finally {
-            createCloseLock.unlock();
         }
+
     }
 
 

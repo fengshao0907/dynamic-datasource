@@ -30,7 +30,7 @@ public class CloseThreadMonitor implements Runnable{
     public void run() {
         while (true){
             try{
-                Thread.sleep(dynamicPool.getDynamicConfig().getCheckIntervalTime());
+                Thread.sleep(dynamicPool.getDynamicConfig().getCheckIntervalTime()*1000);
                 dynamicPool.cleanIdleConn();
             }catch (Throwable t){
                 logger.error("监控关闭线程异常，队列某些线程无法关闭",t);

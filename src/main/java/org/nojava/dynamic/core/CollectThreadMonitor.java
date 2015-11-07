@@ -44,13 +44,14 @@ public class   CollectThreadMonitor implements Runnable{
     public void run() {
         while(true){
             try{
-                Thread.sleep(dynamicConfig.getCollectTime());
+                Thread.sleep(dynamicConfig.getCollectTime() * 1000);
                 logger.info("连接池配置:"+dynamicConfig.toString());
                 DynamicConnectionState dynamicConnectionState=buildDynamicConnectionState();
+                System.out.println(dynamicConnectionState.toString()+"连接池现在状态");
                 logger.info("连接池现在状态："+dynamicConnectionState.toString());
             }   catch (Exception e){
                 logger.error("收集信息线程发生异常",e);
-                e.printStackTrace();
+                throw new RuntimeException("收集信息线程发生异常",e);
             }
         }
     }
